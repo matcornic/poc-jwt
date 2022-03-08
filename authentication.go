@@ -1,24 +1,23 @@
 package main
 
 import (
-	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gin-gonic/gin"
-	"github.com/gobwas/glob"
 	"github.com/google/uuid"
+
+	"poc-jwt/cache"
 )
 
 const (
-	defaultRefreshTokenExpiration = 7 * 24 * time.Hour //  1 Week
-	defaultAccessTokenExpiration  = 15 * time.Minute
 	issuer                        = "SorareData"
 	refreshTokenName              = "sd_refresh_token"
+	defaultRefreshTokenExpiration = 7 * 24 * time.Hour //  1 Week
+	defaultAccessTokenExpiration  = 15 * time.Minute
 )
 
 type AccessDetails struct {
@@ -39,29 +38,28 @@ type TokenDetail struct {
 }
 
 type LoginController struct {
-	cache                  TTLCache
-	refreshTokenExpiration time.Duration
-	accessTokenExpiration  time.Duration
-	refreshSecret          string
-	accessSecret           string
+	db            *AuthenticationDB
+	refreshSecret string
+	accessSecret  string
 }
 
-func NewDefaultAuthenticationController(cache TTLCache, refreshSecret, accessSecret string) *LoginController {
+func NewDefaultAuthenticationController(cache cache.TTLCache, refreshSecret, accessSecret string) *LoginController {
+	authDB := NewAuthenticationDBWithExpiration(cache, defaultRefreshTokenExpiration, defaultAccessTokenExpiration)
 	return &LoginController{
-		cache:                  cache,
-		refreshTokenExpiration: defaultRefreshTokenExpiration,
-		accessTokenExpiration:  defaultAccessTokenExpiration,
-		refreshSecret:          refreshSecret,
-		accessSecret:           accessSecret,
+		db:            authDB,
+		refreshSecret: refreshSecret,
+		accessSecret:  accessSecret,
 	}
 }
 
-func NewShortLivedLoginController(cache TTLCache, refreshSecret, accessSecret string) *LoginController {
+func NewShortLivedLoginController(cache cache.TTLCache, refreshSecret, accessSecret string) *LoginController {
 	// Used for testing
-	ctrl := NewDefaultAuthenticationController(cache, refreshSecret, accessSecret)
-	ctrl.refreshTokenExpiration = 5 * time.Minute
-	ctrl.accessTokenExpiration = 30 * time.Second
-	return ctrl
+	authDB := NewAuthenticationDBWithExpiration(cache, 5*time.Minute, 30*time.Second)
+	return &LoginController{
+		db:            authDB,
+		refreshSecret: refreshSecret,
+		accessSecret:  accessSecret,
+	}
 }
 
 func (ctrl *LoginController) AuthenticationRequired() gin.HandlerFunc {
@@ -78,13 +76,12 @@ func (ctrl *LoginController) AuthenticationRequired() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		username, err := ctrl.fetchAuth(metadata)
-		if err != nil {
-			c.JSON(http.StatusUnauthorized, err.Error())
+		if !ctrl.db.IsAccessValid(metadata.Username, metadata.AccessUuid) {
+			c.JSON(http.StatusUnauthorized, "unauthorized")
 			c.Abort()
 			return
 		}
-		c.Set("username", username)
+		c.Set("username", metadata.Username)
 		c.Next()
 	}
 }
@@ -108,9 +105,29 @@ func (ctrl *LoginController) Login(c *gin.Context) {
 	saveErr := ctrl.saveAuth(user.Username, ts)
 	if saveErr != nil {
 		c.JSON(http.StatusUnprocessableEntity, saveErr.Error())
+		return
 	}
 	ctrl.setRefreshTokenCookie(c, ts.Refresh.Token)
+	ctrl.db.cache.PrintAll()
 	c.JSON(http.StatusOK, ts.Access.Token)
+}
+
+func (ctrl *LoginController) LogoutAllDevices(c *gin.Context) {
+	_, claims, err := ctrl.verifyRefreshToken(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, err)
+		return
+	}
+	_, delErr := ctrl.db.DeleteAllUserTokens(claims.Subject)
+	if delErr != nil {
+		ctrl.forceRefreshTokenCookieToExpire(c)
+		c.JSON(http.StatusUnauthorized, delErr.Error())
+		return
+	}
+	ctrl.forceRefreshTokenCookieToExpire(c)
+	ctrl.db.cache.PrintAll()
+	c.JSON(http.StatusOK, "Successfully logged out every devices")
+	return
 }
 
 func (ctrl *LoginController) Logout(c *gin.Context) {
@@ -119,18 +136,18 @@ func (ctrl *LoginController) Logout(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, err)
 		return
 	}
-	delErr := ctrl.deleteTokens(claims.Id)
+	delErr := ctrl.deleteTokens(claims.Subject, claims.Id)
 	if delErr != nil {
-		c.JSON(http.StatusUnauthorized, delErr.Error())
+		ctrl.forceRefreshTokenCookieToExpire(c)
+		c.JSON(http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	ctrl.forceRefreshTokenCookieToExpire(c)
+	ctrl.db.cache.PrintAll()
 	c.JSON(http.StatusOK, "Successfully logged out")
 }
 
 func (ctrl *LoginController) Refresh(c *gin.Context) {
-	// Extract refresh token from client
-	// Then check if it's still valid
 	refreshToken, claims, err := ctrl.verifyRefreshToken(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, err.Error())
@@ -140,39 +157,33 @@ func (ctrl *LoginController) Refresh(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, "refresh token expired, login required")
 		return
 	}
-	userid, err := ctrl.cache.Get(ctrl.refreshKeyInCache(claims.Id))
+	ok := ctrl.db.IsRefreshValid(claims.Subject, claims.Id)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, err.Error())
+		return
+	}
+	err = ctrl.deleteTokens(claims.Subject, claims.Id)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, err.Error())
 		return
 	}
-	username, _ := userid.(string)
-	if claims.Subject != username {
-		c.JSON(http.StatusUnauthorized, "invalid token")
-		return
-	}
-
-	accessDetail, err := ctrl.createNewAccessToken(username)
+	tokenDetails, err := ctrl.createNewTokens(claims.Subject)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, err.Error())
 		return
 	}
-	tokenDetails := TokenDetails{
-		Access: accessDetail,
-		Refresh: TokenDetail{
-			UUID:    claims.Id,
-			Expires: claims.ExpiresAt,
-		},
-	}
-	saveErr := ctrl.saveAccess(username, tokenDetails)
-	if saveErr != nil {
-		c.JSON(http.StatusForbidden, saveErr.Error())
+	err = ctrl.saveAuth(user.Username, tokenDetails)
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, err.Error())
 		return
 	}
-	c.JSON(http.StatusCreated, accessDetail.Token)
+	ctrl.setRefreshTokenCookie(c, tokenDetails.Refresh.Token)
+	ctrl.db.cache.PrintAll()
+	c.JSON(http.StatusCreated, tokenDetails.Access.Token)
 }
 
 func (ctrl *LoginController) setRefreshTokenCookie(c *gin.Context, refreshToken string) {
-	maxAge := int(ctrl.refreshTokenExpiration.Seconds())
+	maxAge := int(ctrl.db.refreshTokenExpiration.Seconds())
 	// c.SetSameSite(http.SameSiteStrictMode)
 	c.SetCookie(refreshTokenName, refreshToken, maxAge, "", "", true, true)
 }
@@ -182,10 +193,13 @@ func (ctrl *LoginController) forceRefreshTokenCookieToExpire(c *gin.Context) {
 	c.SetCookie(refreshTokenName, "", -1, "", "", true, true)
 }
 
-func (ctrl *LoginController) createNewToken(username string, secret string, expiration time.Duration) (TokenDetail, error) {
+func (ctrl *LoginController) createNewToken(username string, secret string, expiration time.Duration, UUID string) (TokenDetail, error) {
 	now := time.Now().UTC()
+	if UUID == "" {
+		UUID = uuid.New().String()
+	}
 	td := TokenDetail{
-		UUID:    uuid.New().String(),
+		UUID:    UUID,
 		Expires: now.Add(expiration).Unix(),
 	}
 	var err error
@@ -201,12 +215,12 @@ func (ctrl *LoginController) createNewToken(username string, secret string, expi
 	return td, err
 }
 
-func (ctrl *LoginController) createNewRefreshToken(username string) (TokenDetail, error) {
-	return ctrl.createNewToken(username, ctrl.refreshSecret, ctrl.refreshTokenExpiration)
+func (ctrl *LoginController) createNewRefreshToken(username string, uuid string) (TokenDetail, error) {
+	return ctrl.createNewToken(username, ctrl.refreshSecret, ctrl.db.refreshTokenExpiration, uuid)
 }
 
 func (ctrl *LoginController) createNewAccessToken(username string) (TokenDetail, error) {
-	return ctrl.createNewToken(username, ctrl.accessSecret, ctrl.accessTokenExpiration)
+	return ctrl.createNewToken(username, ctrl.accessSecret, ctrl.db.accessTokenExpiration, "")
 }
 
 func (ctrl *LoginController) createNewTokens(username string) (TokenDetails, error) {
@@ -214,7 +228,7 @@ func (ctrl *LoginController) createNewTokens(username string) (TokenDetails, err
 	if err != nil {
 		return TokenDetails{}, err
 	}
-	refreshToken, err := ctrl.createNewRefreshToken(username)
+	refreshToken, err := ctrl.createNewRefreshToken(username, accessToken.UUID)
 	if err != nil {
 		return TokenDetails{}, err
 	}
@@ -224,30 +238,12 @@ func (ctrl *LoginController) createNewTokens(username string) (TokenDetails, err
 	}, nil
 }
 
-func (ctrl *LoginController) saveAccess(username string, td TokenDetails) error {
-	now := time.Now()
-	if td.Access.Expires == 0 || td.Refresh.UUID == "" || td.Access.UUID == "" {
-		return fmt.Errorf("token details require non empty access expiration, refresh and access uuids")
-	}
-	at := time.Unix(td.Access.Expires, 0)
-	return ctrl.cache.SetWithTTL(ctrl.accessKeyInCache(td.Refresh.UUID, td.Access.UUID), username, at.Sub(now))
-}
-
-func (ctrl *LoginController) saveRefresh(username string, td TokenDetails) error {
-	now := time.Now()
-	if td.Refresh.Expires == 0 || td.Refresh.UUID == "" {
-		return fmt.Errorf("token details require non empty access expiration and refresh uuid")
-	}
-	rt := time.Unix(td.Refresh.Expires, 0)
-	return ctrl.cache.SetWithTTL(ctrl.refreshKeyInCache(td.Refresh.UUID), username, rt.Sub(now))
-}
-
 func (ctrl *LoginController) saveAuth(username string, td TokenDetails) error {
-	errAccess := ctrl.saveAccess(username, td)
+	errAccess := ctrl.db.SaveAccessToken(username, td.Access)
 	if errAccess != nil {
 		return errAccess
 	}
-	errRefresh := ctrl.saveRefresh(username, td)
+	errRefresh := ctrl.db.SaveRefreshToken(username, td.Refresh)
 	if errRefresh != nil {
 		return errRefresh
 	}
@@ -312,28 +308,18 @@ func (ctrl *LoginController) extractAccessTokenMetadata(c *gin.Context) (*Access
 	}, nil
 }
 
-func (ctrl *LoginController) fetchAuth(authD *AccessDetails) (string, error) {
-	userid, err := ctrl.cache.Get(ctrl.accessKeyInCache(authD.RefreshUuid, authD.AccessUuid))
-	if err != nil {
-		log.Println(err)
-		return "", errors.New("unauthorized")
+func (ctrl *LoginController) deleteTokens(username string, uuid string) error {
+	if username == "" {
+		return fmt.Errorf("username is required")
 	}
-	userName, _ := userid.(string)
-	if authD.Username != userName {
-		return "", errors.New("unauthorized")
+	if uuid == "" {
+		return fmt.Errorf("token uuid is required")
 	}
-	return userName, nil
-}
-
-func (ctrl *LoginController) deleteTokens(refreshUuid string) error {
-	if refreshUuid == "" {
-		return fmt.Errorf("refresh uuid required")
-	}
-	_, err := ctrl.cache.DelWithPattern(ctrl.accessKeysOfRefreshPattern(refreshUuid))
+	_, err := ctrl.db.DeleteAccessToken(username, uuid)
 	if err != nil {
 		return err
 	}
-	_, err = ctrl.cache.Del(ctrl.refreshKeyInCache(refreshUuid))
+	_, err = ctrl.db.DeleteRefreshToken(username, uuid)
 	if err != nil {
 		return err
 	}
@@ -347,16 +333,4 @@ func (ctrl *LoginController) extractToken(r *http.Request) string {
 		return strArr[1]
 	}
 	return ""
-}
-
-func (ctrl *LoginController) accessKeysOfRefreshPattern(refreshToken string) glob.Glob {
-	return glob.MustCompile("authorization:access:" + refreshToken + ":*")
-}
-
-func (ctrl *LoginController) accessKeyInCache(refreshToken, accessToken string) string {
-	return "authorization:access:" + refreshToken + ":" + accessToken
-}
-
-func (ctrl *LoginController) refreshKeyInCache(refreshToken string) string {
-	return "authorization:refresh:" + refreshToken
 }
